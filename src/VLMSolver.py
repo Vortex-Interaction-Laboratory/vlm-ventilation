@@ -34,6 +34,10 @@ class VLMSolver:
         self.ratio   = ratio      # vortex core radius / mean chord, for the wake roll-up and the induced-velocity loads.
                                   # A Scully core on a physical length regularises the roll-up of the tip vortex sheet;
                                   # 0.05 is a typical value, results are weakly sensitive between 0.02 and 0.1.
+        self.kutta   = "implicit" # unsteady Kutta condition for the newly shed wake rings, set after construction:
+                                  # "implicit": they carry the circulation of the current step and are in A (default);
+                                  # "explicit": they carry the trailing-edge (tip) circulation of the previous step and are
+                                  #             known, in b (Katz & Plotkin, eq. 13.142, the scheme of vlm-wakeRel_cavityFlow)
         self.a_ratio = a_ratio    # cutoff / minimum panel width for the boundary condition (influence matrix A and RHS b).
                                   # A and b must share the same cutoff, and a_ratio must be < 0.5 so that a control point
                                   # never falls inside the cutoff of its own ring.
@@ -319,7 +323,7 @@ class VLMSolver:
         normal   = self.normals
         u_inf  = np.tile(u_inf, (n,1))   # n would return a 1D array [u_x, u_y, u_z, u_x, u_y, u_z, ...] the tuple parameters is needed to reshape it in a (n, 3) array
         b = np.zeros(n)
-        c1, c2, gamma_v = self._full_vectorize(False, skip_shed=True)                     # wake rings of known strength (shed at previous steps)
+        c1, c2, gamma_v = self._full_vectorize(False, skip_shed=(self.kutta != "explicit"))  # wake rings of known strength
         if len(gamma_v) == 0 :                                                             # no wake yet (first step)
             v = np.zeros((n,3))
         else :
@@ -468,8 +472,18 @@ class VLMSolver:
                 raise ValueError(f"Unknown time step distribution '{distribution}', expected 'classic' or 'cosine'")
         dt_A  = None                # time step the current A (and its inverse) was built for
         inv_A = None
+        explicit = self.kutta == "explicit"
+        if self.kutta not in ("implicit", "explicit"):
+            raise ValueError(f"Unknown Kutta condition '{self.kutta}', expected 'implicit' or 'explicit'")
+        if explicit :               # A holds the wing rings only; a first solve without wake gives the circulation the
+            self._build_A(None)     # first shed row will carry
+            inv_A = np.linalg.inv(self.A)
+            self._inv_A = inv_A
+            dt_A  = "explicit"
+            self._build_b()
+            G_prev = inv_A @ self.b
         for s in range(round(t/dt)):
-            if dt_A is None or abs(dta[s]-dt_A) > 1e-12*abs(dt_A) :     # A depends on dt through the newly shed rings
+            if not explicit and (dt_A is None or abs(dta[s]-dt_A) > 1e-12*abs(dt_A)) :     # A depends on dt through the newly shed rings
                 self._build_A(dta[s])
                 inv_A = np.linalg.inv(self.A)
                 self._inv_A = inv_A
@@ -488,7 +502,16 @@ class VLMSolver:
                 l_wake = np.hstack([l_wake.reshape(m+1, s+1, 3), surface.edges["left"].reshape(m+1, 1, 3)]).reshape(-1, 3)          # vertical concatenation
                 r_wake = np.hstack([surface.edges["right"].reshape(m+1, 1, 3), r_wake.reshape(m+1, s+1, 3)]).reshape(-1, 3)         
                 surface._update_wake([wake, l_wake, r_wake])        # updating the wake for the next b computation
-            # right hand side from the older wake rings, solve for the wing and the newly shed rings
+            if explicit :           # the newly shed rings take the edge circulation of the previous step (K&P eq. 13.142)
+                n_gamma = 0
+                for surface in surfaces:
+                    n, m = surface.N, surface.M
+                    Gp = G_prev[n_gamma:n_gamma+n*m]
+                    surface.gamma_wake["middle"] = np.concatenate([Gp[-(n):], surface.gamma_wake["middle"]])
+                    surface.gamma_wake["left"]   = np.hstack([surface.gamma_wake["left"].reshape(m, s), Gp.reshape(m, n)[:,0].reshape(m, 1)]).reshape(-1)
+                    surface.gamma_wake["right"]  = np.hstack([Gp.reshape(m, n)[:,n-1].reshape(m, 1), surface.gamma_wake["right"].reshape(m, s)]).reshape(-1)
+                    n_gamma += n*m
+            # right hand side from the known wake rings, solve for the wing (and, implicit, the newly shed rings)
             self._build_b()
             Gamma_tot = self._solve_step(s, dta[s])             # inv_A @ b, or a derived solver's mixed system (cavities)
             n_gamma = 0                 # give the start of Gamma in Gamma_tot for each surface
@@ -496,10 +519,12 @@ class VLMSolver:
                 n, m   = surface.N, surface.M 
                 Gamma = Gamma_tot[n_gamma:n_gamma+n*m]              # Gamma is the circulation of each panel of this surface
                 surface.gamma                = Gamma
-                surface.gamma_wake["middle"] = np.concatenate([Gamma[-(n):], surface.gamma_wake["middle"]])         # the newly shed wake rings take the circulation of the edge panels at this step
-                surface.gamma_wake["left"]   = np.hstack([surface.gamma_wake["left"].reshape(m, s), Gamma.reshape(m, n)[:,0].reshape(m, 1)]).reshape(-1)            # same with vertical concatenation
-                surface.gamma_wake["right"]  = np.hstack([Gamma.reshape(m, n)[:,n-1].reshape(m, 1), surface.gamma_wake["right"].reshape(m, s)]).reshape(-1)
+                if not explicit :
+                    surface.gamma_wake["middle"] = np.concatenate([Gamma[-(n):], surface.gamma_wake["middle"]])         # the newly shed wake rings take the circulation of the edge panels at this step
+                    surface.gamma_wake["left"]   = np.hstack([surface.gamma_wake["left"].reshape(m, s), Gamma.reshape(m, n)[:,0].reshape(m, 1)]).reshape(-1)            # same with vertical concatenation
+                    surface.gamma_wake["right"]  = np.hstack([Gamma.reshape(m, n)[:,n-1].reshape(m, 1), surface.gamma_wake["right"].reshape(m, s)]).reshape(-1)
                 n_gamma += n*m                                      # updating the position in the total circulation
+            G_prev = Gamma_tot
             self._after_step(s, dta[s])                             # hook for a derived solver (regime update); no-op here
             # simulate the wake rollup
             c1, c2, gamma_v = self._full_vectorize(True)            # getting all the segments (wing + wake) that induce velocity
