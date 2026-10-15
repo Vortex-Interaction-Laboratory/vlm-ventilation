@@ -207,6 +207,8 @@ class VLMSolver:
             c1, c2    -> starting and ending points of each segment
             gamma_seg -> local circulation of each segment
         """
+        if self.kutta == "explicit" :   # every wake ring has a known strength: none is left to the matrix A
+            skip_shed = False
         surfaces  = self.surfaces
         c1_tot = np.empty((0, 3))
         c2_tot = np.empty((0, 3))
