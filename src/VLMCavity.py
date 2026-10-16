@@ -249,15 +249,15 @@ class CavitySolver(VLMSolver):
         self._source_influence = None
         self._Sn = self._St = None          # source influence, built on the first mixed solve (a cavity exists)
         # wetted baseline of each step (alpha_eff -> Psi -> target cavity length):
-        #  "current"  (default): inv(A) b, so with the implicit Kutta condition the rings shed at this step carry the
+        #  "current"  : inv(A) b, so with the implicit Kutta condition the rings shed at this step carry the
         #             WETTED circulation while the older wake carries the ventilated one: a jump of strength placed u dt
         #             behind the trailing edge, which makes the ventilated CL depend on dt (strut AR_h = 1, 12 x 8:
         #             0.1820 / 0.1760 / 0.1713 at dt = 0.05 / 0.2 / 0.83 c);
-        #  "previous": the rings shed at this step carry their previous-step (ventilated) circulation, i.e. the wing
+        #  "previous" (default): the rings shed at this step carry their previous-step (ventilated) circulation, i.e. the wing
         #             wetted in the ventilated wake: Gamma = inv(A_wing) (b - (A - A_wing) Gamma_prev). The ventilated CL
         #             is then nearly dt-independent (0.1869 / 0.1871 / 0.1879), with the fast implicit transient kept.
         #  With kutta = "explicit" both are the same (A holds the wing rings only).
-        self.wetted_baseline = "current"
+        self.wetted_baseline = "previous"
         self._G_prev = None
         self._prepare_geometry()
 
@@ -477,7 +477,9 @@ class CavitySolver(VLMSolver):
         return 0.5 - xcp
 
     # ------------------------------------------------ hooks
-    def _time_sim(self, t, dt, distribution):
+    def _time_sim(self, t=None, dt=None, distribution="classic"):
+        if t is None : t = 1.5*self.c_ref/np.linalg.norm(self.U)       # same defaults as VLMSolver._time_sim
+        if dt is None : dt = 0.05*self.c_ref/np.linalg.norm(self.U)
         self._n_steps = round(t/dt)          # same step count as VLMSolver._time_sim
         return super()._time_sim(t, dt, distribution)
 

@@ -436,7 +436,7 @@ class VLMSolver:
         """Hook called after the circulations of step s are stored and before the wake roll-up. No-op in the base solver."""
         return None
 
-    def _time_sim(self, t, dt, distribution):
+    def _time_sim(self, t=None, dt=None, distribution="classic"):
         """ 
         Do the time stepping simulation with the wake relaxation
 
@@ -450,6 +450,13 @@ class VLMSolver:
             dt           -> time step length
             distribution -> type of time step distribution
         """
+        # defaults (implicit Kutta condition): 1.5 chords of travel with dt = 0.05 chord (30 steps) keep CL within 1 % of its
+        # dt -> 0, t -> infinity value (strut AR_h 0.5 and 1, wetted and ventilated with wetted_baseline "previous",
+        # 12 x 8 panels: worst error 0.7 %).
+        if t is None :
+            t = 1.5*self.c_ref/np.linalg.norm(self.U)
+        if dt is None :
+            dt = 0.05*self.c_ref/np.linalg.norm(self.U)
         # Initialization
         u_inf    = self.U
         surfaces = self.surfaces
