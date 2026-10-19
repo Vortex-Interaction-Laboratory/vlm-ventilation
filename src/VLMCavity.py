@@ -478,8 +478,7 @@ class CavitySolver(VLMSolver):
 
     # ------------------------------------------------ hooks
     def _time_sim(self, t=None, dt=None, distribution="classic"):
-        if t is None : t = 1.5*self.c_ref/np.linalg.norm(self.U)       # same defaults as VLMSolver._time_sim
-        if dt is None : dt = 0.05*self.c_ref/np.linalg.norm(self.U)
+        t, dt = self._default_time(t, dt)          # same defaults as VLMSolver._time_sim
         self._n_steps = round(t/dt)          # same step count as VLMSolver._time_sim
         return super()._time_sim(t, dt, distribution)
 

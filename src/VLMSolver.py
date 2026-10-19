@@ -436,6 +436,22 @@ class VLMSolver:
         """Hook called after the circulations of step s are stored and before the wake roll-up. No-op in the base solver."""
         return None
 
+    def _default_time(self, t=None, dt=None):
+        """Default travel and time step where not given. -> (t, dt) in seconds"""
+        # Default time settings, common to vlm-ventilation and vlm-wakeRel_cavityFlow (implicit Kutta condition): 1.5 chords
+        # of travel, and a time step tied to the mean spanwise panel width w, dt = min(0.05 c, max(0.025 c, 0.6 w)). The
+        # time-step error grows as the spanwise panels get narrower than the wake rings shed in one step (strut AR_h = 1,
+        # dt = 0.05 c: +0.1 % at w = c/12, +0.6 % at w = c/24, +1.1 % at w = c/96 in vlm-wakeRel_cavityFlow). With this rule
+        # CL stays within 1 % of its dt -> 0, t -> infinity value on the strut (AR_h 0.5 and 1, wetted and ventilated,
+        # 12 x 8 panels: worst 0.72 %; AR_h 1 up to N = 96: below 0.9 %). Pass t and dt to override.
+        u = np.linalg.norm(self.U)
+        if t is None :
+            t = 1.5*self.c_ref/u
+        if dt is None :
+            width = np.mean([np.linalg.norm(np.atleast_1d(p.width)) for sf in self.surfaces for p in sf.wing_panels["real"]])
+            dt = min(0.05*self.c_ref, max(0.025*self.c_ref, 0.6*width))/u
+        return t, dt
+
     def _time_sim(self, t=None, dt=None, distribution="classic"):
         """ 
         Do the time stepping simulation with the wake relaxation
@@ -450,13 +466,7 @@ class VLMSolver:
             dt           -> time step length
             distribution -> type of time step distribution
         """
-        # defaults (implicit Kutta condition): 1.5 chords of travel with dt = 0.05 chord (30 steps) keep CL within 1 % of its
-        # dt -> 0, t -> infinity value (strut AR_h 0.5 and 1, wetted and ventilated with wetted_baseline "previous",
-        # 12 x 8 panels: worst error 0.7 %).
-        if t is None :
-            t = 1.5*self.c_ref/np.linalg.norm(self.U)
-        if dt is None :
-            dt = 0.05*self.c_ref/np.linalg.norm(self.U)
+        t, dt = self._default_time(t, dt)
         # Initialization
         u_inf    = self.U
         surfaces = self.surfaces
