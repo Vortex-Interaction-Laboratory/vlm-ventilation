@@ -28,7 +28,7 @@ class VLMSolver:
         self.b = None       # right hand side
 
         # Numerical parameters
-        self.rc      = None       # smallest panel dimension (width or chord) - reference length of the cutoff distance
+        self.rc      = None       # smallest panel height (across width or chord) - reference length of the cutoff distance
         self.c_ref   = None       # mean chord - reference length of the vortex core radius
         self.core    = None       # vortex core radius [m] = ratio * c_ref
         self.ratio   = ratio      # vortex core radius / mean chord, for the wake roll-up and the induced-velocity loads.
@@ -60,10 +60,15 @@ class VLMSolver:
         r_min = np.inf
         chords = []
         for surface in self.surfaces :
-            # smallest panel dimension of the lattice, width or chord: the cutoff is a fraction of it, so that no
-            # control point ever falls inside the cutoff of a neighbouring segment whatever the panel aspect ratio
+            # smallest panel HEIGHT of the lattice, across the width or across the chord (area / side length): the
+            # cutoff is a fraction of it, so that no control point ever falls inside the cutoff of a segment of its own
+            # ring whatever the panel aspect ratio. On a swept (parallelogram) panel the control point is only
+            # width*cos(sweep)/2 from its side legs, not width/2: with the side length instead of the height, a cutoff
+            # of 0.4 side lengths swallowed those legs beyond about 37 deg of sweep and A became singular (45 deg, AR 5:
+            # C_L of -100 to 1e5). On rectangular panels height and side are the same and nothing changes.
             for panel in surface.wing_panels["real"] :
-                r_surf = min(np.linalg.norm(panel.width), np.linalg.norm(panel.chord))
+                a = float(panel.area)
+                r_surf = min(a/np.linalg.norm(panel.width), a/np.linalg.norm(panel.chord))
                 if r_surf < r_min :
                     r_min = r_surf
             N_tot += surface.N * surface.M
