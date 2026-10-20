@@ -34,6 +34,7 @@ class VLMSolver:
         self.ratio   = ratio      # vortex core radius / mean chord, for the wake roll-up and the induced-velocity loads.
                                   # A Scully core on a physical length regularises the roll-up of the tip vortex sheet;
                                   # 0.05 is a typical value, results are weakly sensitive between 0.02 and 0.1.
+        self.rollup  = True       # wake roll-up, set after construction: False keeps the wake rigid (each row convected by u_inf only)
         self.kutta   = "implicit" # unsteady Kutta condition for the newly shed wake rings, set after construction:
                                   # "implicit": they carry the circulation of the current step and are in A (default);
                                   # "explicit": they carry the trailing-edge (tip) circulation of the previous step and are
@@ -551,21 +552,22 @@ class VLMSolver:
             G_prev = Gamma_tot
             self._after_step(s, dta[s])                             # hook for a derived solver (regime update); no-op here
             # simulate the wake rollup
-            c1, c2, gamma_v = self._full_vectorize(True)            # getting all the segments (wing + wake) that induce velocity
+            c1, c2, gamma_v = self._full_vectorize(True) if self.rollup else (None, None, None)            # getting all the segments (wing + wake) that induce velocity
             for surface in surfaces:
                 n, m   = surface.N, surface.M 
                 wake   = surface.wake["real"]["middle"]
                 l_wake = surface.wake["real"]["left"]
                 r_wake = surface.wake["real"]["right"]
-                wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, 0.0, self.core)])    # each corner point except at the edges are convect by the induced velocity
-                l_wake = l_wake + np.hstack([
-                    dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
-                    np.zeros((m+1,1,3))
-                    ]).reshape(-1, 3)                               # reshape in 2D grid to not take into account the tip edge
-                r_wake = r_wake + np.hstack([
-                    np.zeros((m+1,1,3)), 
-                    dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
-                    ]).reshape(-1, 3)
+                if self.rollup :                                    # free wake: the corner points follow the induced velocity
+                    wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, 0.0, self.core)])    # each corner point except at the edges are convect by the induced velocity
+                    l_wake = l_wake + np.hstack([
+                        dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
+                        np.zeros((m+1,1,3))
+                        ]).reshape(-1, 3)                               # reshape in 2D grid to not take into account the tip edge
+                    r_wake = r_wake + np.hstack([
+                        np.zeros((m+1,1,3)), 
+                        dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
+                        ]).reshape(-1, 3)
                 surface._update_wake([wake, l_wake, r_wake])
                 # at the last step we build the wake panels, usefull for plotting
                 if s == round(t/dt)-1 :
