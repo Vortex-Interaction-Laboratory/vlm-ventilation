@@ -480,6 +480,7 @@ class CavitySolver(VLMSolver):
     def _time_sim(self, t=None, dt=None, distribution="classic"):
         t, dt = self._default_time(t, dt)          # same defaults as VLMSolver._time_sim
         self._n_steps = round(t/dt)          # same step count as VLMSolver._time_sim
+        self._G_prev = None                  # no lagged baseline from a previous run
         return super()._time_sim(t, dt, distribution)
 
     def _dormant(self):
