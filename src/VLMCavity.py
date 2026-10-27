@@ -247,6 +247,18 @@ class CavitySolver(VLMSolver):
         self.vent = Ventilation(self, g, dsigma, rate, inception=inception, washout=washout)
         self._cavity_geo = {}
         self._source_influence = None
+        self._Sn = self._St = None          # source influence, built on the first mixed solve (a cavity exists)
+        # wetted baseline of each step (alpha_eff -> Psi -> target cavity length):
+        #  "current"  : inv(A) b, so with the implicit Kutta condition the rings shed at this step carry the
+        #             WETTED circulation while the older wake carries the ventilated one: a jump of strength placed u dt
+        #             behind the trailing edge, which makes the ventilated CL depend on dt (strut AR_h = 1, 12 x 8:
+        #             0.1820 / 0.1760 / 0.1713 at dt = 0.05 / 0.2 / 0.83 c);
+        #  "previous" (default): the rings shed at this step carry their previous-step (ventilated) circulation, i.e. the wing
+        #             wetted in the ventilated wake: Gamma = inv(A_wing) (b - (A - A_wing) Gamma_prev). The ventilated CL
+        #             is then nearly dt-independent (0.1869 / 0.1871 / 0.1879), with the fast implicit transient kept.
+        #  With kutta = "explicit" both are the same (A holds the wing rings only).
+        self.wetted_baseline = "previous"
+        self._G_prev = None
         self._prepare_geometry()
 
     # ------------------------------------------------ geometry and influence of the source sheet
@@ -273,7 +285,10 @@ class CavitySolver(VLMSolver):
                                                  depth=depth, sigma=sigma, depth_sec=depth.reshape(m, n).mean(axis=0),
                                                  sigma_sec=sigma.reshape(m, n).mean(axis=0), xc=xc.reshape(-1),
                                                  span_sec=span_sec, span_total=span_sec.max() + ds, ds=ds)
-        # source influence of every panel at the pressure-side (normal) and suction-side (tangential) points
+
+    def _build_source_influence(self):
+        """Source influence of every panel at the pressure-side (normal) and suction-side (tangential) points.
+        O(N_tot^2) panel-pair evaluations; only the mixed solve needs it, so it is built on the first cavity."""
         offs = 0
         K = self.N_tot
         Sn = np.zeros((K, K)); St = np.zeros((K, K))
@@ -305,6 +320,8 @@ class CavitySolver(VLMSolver):
         kinematic condition of each section (long-cavity branch; 1 leaves the section untouched).
         -> Gamma (N_tot,), q (N_tot,) with zeros on wetted panels, closure residual per section (dict), open flags (dict)
         """
+        if self._Sn is None:
+            self._build_source_influence()
         A = self.A; K = self.N_tot
         b = self.b.copy()
         if slope_ratio is not None:
@@ -460,18 +477,59 @@ class CavitySolver(VLMSolver):
         return 0.5 - xcp
 
     # ------------------------------------------------ hooks
+    def _time_sim(self, t=None, dt=None, distribution="classic"):
+        t, dt = self._default_time(t, dt)          # same defaults as VLMSolver._time_sim
+        self._n_steps = round(t/dt)          # same step count as VLMSolver._time_sim
+        self._G_prev = None                  # no lagged baseline from a previous run
+        return super()._time_sim(t, dt, distribution)
+
+    def _dormant(self):
+        """True when no cavity can form or persist during the run: no section active, none forced and no inception
+        model. The regime then stays FW at every step, and the cavity diagnostics of the state (L_target, alpha_eff,
+        xcp) are only needed at the last step; skipping them before leaves every result unchanged."""
+        return self.vent.inception is None and not any(
+            st["forced"] is not None or bool(np.any(st["active"])) for st in self.vent.state.values())
+
+    def _baseline(self):
+        """Wetted circulation of this step for the cavity targets, see wetted_baseline."""
+        if self.wetted_baseline not in ("current", "previous"):
+            raise ValueError(f"unknown wetted_baseline '{self.wetted_baseline}', expected 'current' or 'previous'")
+        if self.wetted_baseline == "current" or self.kutta == "explicit" or self._G_prev is None:
+            return self._inv_A @ self.b
+        if getattr(self, "_bl_for", None) is not self._inv_A:          # A was (re)built for this dt: wing-only part
+            A = self.A
+            self._build_A(None); A_w = self.A
+            self.A = A
+            self._bl_inv_w = np.linalg.inv(A_w); self._bl_S = A - A_w; self._bl_for = self._inv_A
+        return self._bl_inv_w @ (self.b - self._bl_S @ self._G_prev)
+
     def _solve_step(self, s, dt):
-        self._gamma_wetted = self._inv_A @ self.b
+        self._gamma_wetted = self._baseline()
+        Gamma = self._solve_step_core(s, dt)
+        self._G_prev = np.array(Gamma, float)
+        return Gamma
+
+    def _wetted_solution(self):
+        """Solution of the step when no section is ventilated: the baseline itself unless it was lagged."""
+        if self.wetted_baseline == "previous" and self.kutta != "explicit" and self._G_prev is not None:
+            return self._inv_A @ self.b
+        return self._gamma_wetted
+
+    def _solve_step_core(self, s, dt):
         u = float(np.linalg.norm(self.U))
         any_active = any(bool(np.any(self.vent.state[id(sf)]["active"])) for sf in self.surfaces)
         if not any_active:
             self._q = np.zeros(self.N_tot)
+            if self._dormant() and s < getattr(self, "_n_steps", 0) - 1:
+                for surface in self.surfaces:
+                    self.vent.state[id(surface)]["branch"] = np.full(surface.N, "wet")
+                return self._wetted_solution()
             for surface in self.surfaces:
                 st = self.vent.state[id(surface)]
                 st["L_target"], st["alpha_eff"] = self._sectional_targets(surface)
                 st["xcp"] = self._centre_of_pressure(surface, self._gamma_wetted)
                 st["branch"] = np.full(surface.N, "wet")
-            return self._gamma_wetted
+            return self._wetted_solution()
         lengths = {}
         for surface in self.surfaces:
             st = self.vent.state[id(surface)]; g = self._cavity_geo[id(surface)]
@@ -497,23 +555,23 @@ class CavitySolver(VLMSolver):
             st = self.vent.state[id(surface)]; g = self._cavity_geo[id(surface)]
             m, n = surface.M, surface.N
             # can a cavity exist on each section: the sectional length resolves at least one panel
-            can_hold = np.asarray(st["L_target"], float) >= 1.0/m
+            can_hold = lambda: np.asarray(st["L_target"], float) >= 1.0/m      # evaluated only where it is used
             if not np.any(st["active"]):
                 # formation: inception signal or forced
                 seed = None
                 if st["forced"] is not None:
-                    seed = st["forced"] & can_hold
+                    seed = st["forced"] & can_hold()
                 elif self.vent.inception is not None:
                     self._kuttas_loads()
                     a = self.vent.inception(surface, self)
                     if a["incepts"]:
-                        seed = a["state"]["prone"] & can_hold
+                        seed = a["state"]["prone"] & can_hold()
                         st["route"] = a["route"]
                 if seed is not None and np.any(seed):
                     st["active"] = seed.copy(); st["L"] = np.zeros(n); st["unstable"] = False
             else:
                 # persistence: a section keeps its cavity while a cavity can exist there
-                st["active"] &= can_hold
+                st["active"] &= can_hold()
                 st["L"] = np.where(st["active"], st["L"], 0.0)
                 # elimination: the re-entrant jet. Harwood et al. (2016, Sect. 4) decide the stability of the
                 # fully ventilated cavity at the representative mid-depth section kappa = 0.5, where the jet

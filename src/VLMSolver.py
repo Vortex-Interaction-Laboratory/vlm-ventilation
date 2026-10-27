@@ -28,12 +28,17 @@ class VLMSolver:
         self.b = None       # right hand side
 
         # Numerical parameters
-        self.rc      = None       # smallest panel dimension (width or chord) - reference length of the cutoff distance
+        self.rc      = None       # smallest panel height (across width or chord) - reference length of the cutoff distance
         self.c_ref   = None       # mean chord - reference length of the vortex core radius
         self.core    = None       # vortex core radius [m] = ratio * c_ref
         self.ratio   = ratio      # vortex core radius / mean chord, for the wake roll-up and the induced-velocity loads.
                                   # A Scully core on a physical length regularises the roll-up of the tip vortex sheet;
                                   # 0.05 is a typical value, results are weakly sensitive between 0.02 and 0.1.
+        self.rollup  = True       # wake roll-up, set after construction: False keeps the wake rigid (each row convected by u_inf only)
+        self.kutta   = "implicit" # unsteady Kutta condition for the newly shed wake rings, set after construction:
+                                  # "implicit": they carry the circulation of the current step and are in A (default);
+                                  # "explicit": they carry the trailing-edge (tip) circulation of the previous step and are
+                                  #             known, in b (Katz & Plotkin, eq. 13.142, the scheme of vlm-wakeRel_cavityFlow)
         self.a_ratio = a_ratio    # cutoff / minimum panel width for the boundary condition (influence matrix A and RHS b).
                                   # A and b must share the same cutoff, and a_ratio must be < 0.5 so that a control point
                                   # never falls inside the cutoff of its own ring.
@@ -56,10 +61,15 @@ class VLMSolver:
         r_min = np.inf
         chords = []
         for surface in self.surfaces :
-            # smallest panel dimension of the lattice, width or chord: the cutoff is a fraction of it, so that no
-            # control point ever falls inside the cutoff of a neighbouring segment whatever the panel aspect ratio
+            # smallest panel HEIGHT of the lattice, across the width or across the chord (area / side length): the
+            # cutoff is a fraction of it, so that no control point ever falls inside the cutoff of a segment of its own
+            # ring whatever the panel aspect ratio. On a swept (parallelogram) panel the control point is only
+            # width*cos(sweep)/2 from its side legs, not width/2: with the side length instead of the height, a cutoff
+            # of 0.4 side lengths swallowed those legs beyond about 37 deg of sweep and A became singular (45 deg, AR 5:
+            # C_L of -100 to 1e5). On rectangular panels height and side are the same and nothing changes.
             for panel in surface.wing_panels["real"] :
-                r_surf = min(np.linalg.norm(panel.width), np.linalg.norm(panel.chord))
+                a = float(panel.area)
+                r_surf = min(a/np.linalg.norm(panel.width), a/np.linalg.norm(panel.chord))
                 if r_surf < r_min :
                     r_min = r_surf
             N_tot += surface.N * surface.M
@@ -203,6 +213,8 @@ class VLMSolver:
             c1, c2    -> starting and ending points of each segment
             gamma_seg -> local circulation of each segment
         """
+        if self.kutta == "explicit" :   # every wake ring has a known strength: none is left to the matrix A
+            skip_shed = False
         surfaces  = self.surfaces
         c1_tot = np.empty((0, 3))
         c2_tot = np.empty((0, 3))
@@ -319,7 +331,7 @@ class VLMSolver:
         normal   = self.normals
         u_inf  = np.tile(u_inf, (n,1))   # n would return a 1D array [u_x, u_y, u_z, u_x, u_y, u_z, ...] the tuple parameters is needed to reshape it in a (n, 3) array
         b = np.zeros(n)
-        c1, c2, gamma_v = self._full_vectorize(False, skip_shed=True)                     # wake rings of known strength (shed at previous steps)
+        c1, c2, gamma_v = self._full_vectorize(False, skip_shed=(self.kutta != "explicit"))  # wake rings of known strength
         if len(gamma_v) == 0 :                                                             # no wake yet (first step)
             v = np.zeros((n,3))
         else :
@@ -430,7 +442,23 @@ class VLMSolver:
         """Hook called after the circulations of step s are stored and before the wake roll-up. No-op in the base solver."""
         return None
 
-    def _time_sim(self, t, dt, distribution):
+    def _default_time(self, t=None, dt=None):
+        """Default travel and time step where not given. -> (t, dt) in seconds"""
+        # Default time settings, common to vlm-ventilation and vlm-wakeRel_cavityFlow (implicit Kutta condition): 1.5 chords
+        # of travel, and a time step tied to the mean spanwise panel width w, dt = min(0.05 c, max(0.025 c, 0.6 w)). The
+        # time-step error grows as the spanwise panels get narrower than the wake rings shed in one step (strut AR_h = 1,
+        # dt = 0.05 c: +0.1 % at w = c/12, +0.6 % at w = c/24, +1.1 % at w = c/96 in vlm-wakeRel_cavityFlow). With this rule
+        # CL stays within 1 % of its dt -> 0, t -> infinity value on the strut (AR_h 0.5 and 1, wetted and ventilated,
+        # 12 x 8 panels: worst 0.72 %; AR_h 1 up to N = 96: below 0.9 %). Pass t and dt to override.
+        u = np.linalg.norm(self.U)
+        if t is None :
+            t = 1.5*self.c_ref/u
+        if dt is None :
+            width = np.mean([np.linalg.norm(np.atleast_1d(p.width)) for sf in self.surfaces for p in sf.wing_panels["real"]])
+            dt = min(0.05*self.c_ref, max(0.025*self.c_ref, 0.6*width))/u
+        return t, dt
+
+    def _time_sim(self, t=None, dt=None, distribution="classic"):
         """ 
         Do the time stepping simulation with the wake relaxation
 
@@ -444,6 +472,7 @@ class VLMSolver:
             dt           -> time step length
             distribution -> type of time step distribution
         """
+        t, dt = self._default_time(t, dt)
         # Initialization
         u_inf    = self.U
         surfaces = self.surfaces
@@ -468,8 +497,18 @@ class VLMSolver:
                 raise ValueError(f"Unknown time step distribution '{distribution}', expected 'classic' or 'cosine'")
         dt_A  = None                # time step the current A (and its inverse) was built for
         inv_A = None
+        explicit = self.kutta == "explicit"
+        if self.kutta not in ("implicit", "explicit"):
+            raise ValueError(f"Unknown Kutta condition '{self.kutta}', expected 'implicit' or 'explicit'")
+        if explicit :               # A holds the wing rings only; a first solve without wake gives the circulation the
+            self._build_A(None)     # first shed row will carry
+            inv_A = np.linalg.inv(self.A)
+            self._inv_A = inv_A
+            dt_A  = "explicit"
+            self._build_b()
+            G_prev = inv_A @ self.b
         for s in range(round(t/dt)):
-            if dt_A is None or abs(dta[s]-dt_A) > 1e-12*abs(dt_A) :     # A depends on dt through the newly shed rings
+            if not explicit and (dt_A is None or abs(dta[s]-dt_A) > 1e-12*abs(dt_A)) :     # A depends on dt through the newly shed rings
                 self._build_A(dta[s])
                 inv_A = np.linalg.inv(self.A)
                 self._inv_A = inv_A
@@ -488,7 +527,16 @@ class VLMSolver:
                 l_wake = np.hstack([l_wake.reshape(m+1, s+1, 3), surface.edges["left"].reshape(m+1, 1, 3)]).reshape(-1, 3)          # vertical concatenation
                 r_wake = np.hstack([surface.edges["right"].reshape(m+1, 1, 3), r_wake.reshape(m+1, s+1, 3)]).reshape(-1, 3)         
                 surface._update_wake([wake, l_wake, r_wake])        # updating the wake for the next b computation
-            # right hand side from the older wake rings, solve for the wing and the newly shed rings
+            if explicit :           # the newly shed rings take the edge circulation of the previous step (K&P eq. 13.142)
+                n_gamma = 0
+                for surface in surfaces:
+                    n, m = surface.N, surface.M
+                    Gp = G_prev[n_gamma:n_gamma+n*m]
+                    surface.gamma_wake["middle"] = np.concatenate([Gp[-(n):], surface.gamma_wake["middle"]])
+                    surface.gamma_wake["left"]   = np.hstack([surface.gamma_wake["left"].reshape(m, s), Gp.reshape(m, n)[:,0].reshape(m, 1)]).reshape(-1)
+                    surface.gamma_wake["right"]  = np.hstack([Gp.reshape(m, n)[:,n-1].reshape(m, 1), surface.gamma_wake["right"].reshape(m, s)]).reshape(-1)
+                    n_gamma += n*m
+            # right hand side from the known wake rings, solve for the wing (and, implicit, the newly shed rings)
             self._build_b()
             Gamma_tot = self._solve_step(s, dta[s])             # inv_A @ b, or a derived solver's mixed system (cavities)
             n_gamma = 0                 # give the start of Gamma in Gamma_tot for each surface
@@ -496,27 +544,30 @@ class VLMSolver:
                 n, m   = surface.N, surface.M 
                 Gamma = Gamma_tot[n_gamma:n_gamma+n*m]              # Gamma is the circulation of each panel of this surface
                 surface.gamma                = Gamma
-                surface.gamma_wake["middle"] = np.concatenate([Gamma[-(n):], surface.gamma_wake["middle"]])         # the newly shed wake rings take the circulation of the edge panels at this step
-                surface.gamma_wake["left"]   = np.hstack([surface.gamma_wake["left"].reshape(m, s), Gamma.reshape(m, n)[:,0].reshape(m, 1)]).reshape(-1)            # same with vertical concatenation
-                surface.gamma_wake["right"]  = np.hstack([Gamma.reshape(m, n)[:,n-1].reshape(m, 1), surface.gamma_wake["right"].reshape(m, s)]).reshape(-1)
+                if not explicit :
+                    surface.gamma_wake["middle"] = np.concatenate([Gamma[-(n):], surface.gamma_wake["middle"]])         # the newly shed wake rings take the circulation of the edge panels at this step
+                    surface.gamma_wake["left"]   = np.hstack([surface.gamma_wake["left"].reshape(m, s), Gamma.reshape(m, n)[:,0].reshape(m, 1)]).reshape(-1)            # same with vertical concatenation
+                    surface.gamma_wake["right"]  = np.hstack([Gamma.reshape(m, n)[:,n-1].reshape(m, 1), surface.gamma_wake["right"].reshape(m, s)]).reshape(-1)
                 n_gamma += n*m                                      # updating the position in the total circulation
+            G_prev = Gamma_tot
             self._after_step(s, dta[s])                             # hook for a derived solver (regime update); no-op here
             # simulate the wake rollup
-            c1, c2, gamma_v = self._full_vectorize(True)            # getting all the segments (wing + wake) that induce velocity
+            c1, c2, gamma_v = self._full_vectorize(True) if self.rollup else (None, None, None)            # getting all the segments (wing + wake) that induce velocity
             for surface in surfaces:
                 n, m   = surface.N, surface.M 
                 wake   = surface.wake["real"]["middle"]
                 l_wake = surface.wake["real"]["left"]
                 r_wake = surface.wake["real"]["right"]
-                wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, 0.0, self.core)])    # each corner point except at the edges are convect by the induced velocity
-                l_wake = l_wake + np.hstack([
-                    dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
-                    np.zeros((m+1,1,3))
-                    ]).reshape(-1, 3)                               # reshape in 2D grid to not take into account the tip edge
-                r_wake = r_wake + np.hstack([
-                    np.zeros((m+1,1,3)), 
-                    dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
-                    ]).reshape(-1, 3)
+                if self.rollup :                                    # free wake: the corner points follow the induced velocity
+                    wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, 0.0, self.core)])    # each corner point except at the edges are convect by the induced velocity
+                    l_wake = l_wake + np.hstack([
+                        dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
+                        np.zeros((m+1,1,3))
+                        ]).reshape(-1, 3)                               # reshape in 2D grid to not take into account the tip edge
+                    r_wake = r_wake + np.hstack([
+                        np.zeros((m+1,1,3)), 
+                        dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, 0.0, self.core).reshape(m+1, s+1, 3),
+                        ]).reshape(-1, 3)
                 surface._update_wake([wake, l_wake, r_wake])
                 # at the last step we build the wake panels, usefull for plotting
                 if s == round(t/dt)-1 :

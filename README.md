@@ -25,6 +25,14 @@ The rings shed at the current time step from the trailing edge and from the tips
 
 The study behind these choices is in `docs/tip_loading/`.
 
+Options set as attributes after construction (defaults leave the results above unchanged):
+
+- `vlm.rollup = False`: frozen wake, every shed row convected by `u_inf` only (no roll-up). Default `True`.
+- `vlm.kutta = "explicit"`: the newly shed rings take the trailing-edge circulation of the previous step instead of being part of the influence matrix. Default `"implicit"`.
+- `vlm.wetted_baseline` (`CavitySolver` only): `"previous"` (default) builds the wetted baseline of the cavity targets from the previous step's circulation, `"current"` solves it again each step.
+
+`vlm._time_sim()` without arguments uses 1.5 chords of travel and `dt = min(0.05 c, max(0.025 c, 0.6 w)) / u`, `w` the mean spanwise panel width, the same rule as vlm-wakeRel_cavityFlow: the lift stays within 1 % of its converged value on the strut. Pass `t` and `dt` to override.
+
 ## Ventilation inception (branch `vent/inception`)
 
 `src/VLMInception.py` assesses, after a run, whether atmospheric ventilation incepts on a
@@ -62,4 +70,5 @@ vlm.vent.report(surface)          # regime, cavity length and centre of pressure
 
 This branch also corrects the reference length of the cutoff in the base solver: it is now the
 smallest panel dimension, width or chord, so that wide panels (high aspect ratio with few
-sections) no longer exclude neighbouring segments from the influence matrix.
+sections) no longer exclude neighbouring segments from the influence matrix. On swept panels
+the width is measured as the height across the side legs (`width cos(sweep)`), not along them.
